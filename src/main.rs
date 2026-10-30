@@ -15,14 +15,18 @@ use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eCapture, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Same shortcut PowerToys' Video Conference Mute used for the microphone.
-const HOTKEY_MODIFIERS: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(MOD_WIN.0 | MOD_SHIFT.0);
-const HOTKEY_KEY: u32 = b'A' as u32;
+// Same shortcut PowerToys' Video Conference Mute used for the microphone. Windows 11
+// registers Win+Shift+A itself, so RegisterHotKey fails; like PowerToys, mutekey watches the
+// keyboard with a low-level hook instead and swallows the keystroke.
+const HOTKEY_KEY: VIRTUAL_KEY = VK_A;
 const HOTKEY_LABEL: &str = "Win+Shift+A";
 
 // Badge geometry in 96-DPI pixels, centered at the top of the primary screen.
@@ -38,11 +42,11 @@ const GREEN: COLORREF = rgb(16, 160, 72);
 const GRAY: COLORREF = rgb(128, 128, 128);
 const WHITE: COLORREF = rgb(255, 255, 255);
 
-const HOTKEY_ID: i32 = 1;
 const POLL_TIMER_ID: usize = 1;
 const POLL_INTERVAL_MS: u32 = 500;
 const TRAY_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_HOTKEY_PRESSED: u32 = WM_APP + 2;
 const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
 
@@ -79,6 +83,8 @@ impl App {
 thread_local! {
     static APP: Cell<Option<App>> = const { Cell::new(None) };
     static STATE: Cell<MicState> = const { Cell::new(MicState::NoMicrophone) };
+    // The hotkey's key is down and its keystroke was swallowed (so its key-up must be too).
+    static HOTKEY_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
 fn main() {
@@ -91,6 +97,13 @@ fn run() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+
+        // A second copy would toggle the mute straight back on every press.
+        let _single_instance = CreateMutexW(None, true, w!("Local\\mutekey"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            error_box("mutekey is already running.");
+            return Ok(());
+        }
 
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("mutekey");
@@ -131,12 +144,7 @@ fn run() -> Result<()> {
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));
 
-        if RegisterHotKey(controller, HOTKEY_ID, HOTKEY_MODIFIERS | MOD_NOREPEAT, HOTKEY_KEY).is_err() {
-            error_box(&format!(
-                "{HOTKEY_LABEL} is already taken by another app (or mutekey is already running)."
-            ));
-            return Ok(());
-        }
+        SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0)?;
 
         let state = current_state();
         STATE.set(state);
@@ -159,7 +167,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
         match msg {
-            WM_HOTKEY if wparam.0 == HOTKEY_ID as usize => toggle_mute(),
+            WM_HOTKEY_PRESSED => toggle_mute(),
             WM_TIMER if wparam.0 == POLL_TIMER_ID => refresh(),
             WM_TRAY => match lparam.0 as u32 {
                 WM_LBUTTONUP => toggle_mute(),
@@ -177,6 +185,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         LRESULT(0)
     }
+}
+
+/// Runs on the UI thread for every keystroke system-wide, so it only posts a message: Windows
+/// drops hooks that take too long, and the audio calls can be slow.
+extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code == HC_ACTION as i32 && (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode == HOTKEY_KEY.0 as u32 {
+            if matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                if hotkey_modifiers_held() {
+                    // Auto-repeat while the key is held toggles only once.
+                    if !HOTKEY_HELD.replace(true) {
+                        if let Some(app) = APP.get() {
+                            let _ = PostMessageW(app.controller, WM_HOTKEY_PRESSED, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                    return LRESULT(1);
+                }
+                HOTKEY_HELD.set(false);
+            } else if HOTKEY_HELD.replace(false) {
+                return LRESULT(1);
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+fn hotkey_modifiers_held() -> bool {
+    let held = |vk: VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
+    (held(VK_LWIN) || held(VK_RWIN)) && held(VK_SHIFT) && !held(VK_CONTROL) && !held(VK_MENU)
 }
 
 fn microphones() -> Result<Vec<IAudioEndpointVolume>> {
