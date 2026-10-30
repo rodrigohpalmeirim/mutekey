@@ -8,3 +8,31 @@
 111 ICON "icons/tray-live-dark.ico"
 112 ICON "icons/tray-muted-dark.ico"
 113 ICON "icons/tray-none-dark.ico"
+
+// Shown by Explorer's file properties, Task Manager and its Startup apps page.
+#include "version.h"
+1 VERSIONINFO
+FILEVERSION VERSION_NUMBER
+PRODUCTVERSION VERSION_NUMBER
+FILEOS 0x40004 // VOS_NT_WINDOWS32
+FILETYPE 0x1   // VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Rodrigo Palmeirim"
+            VALUE "FileDescription", "mutekey"
+            VALUE "FileVersion", VERSION_STRING
+            VALUE "InternalName", "mutekey"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Rodrigo Palmeirim. MIT License."
+            VALUE "OriginalFilename", "mutekey.exe"
+            VALUE "ProductName", "mutekey"
+            VALUE "ProductVersion", VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
