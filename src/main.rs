@@ -1,7 +1,8 @@
 //! mutekey: a global hotkey that mutes every microphone, an always-on-top badge
-//! while muted, and a tray icon (green = live, red = muted). Left-click the tray
-//! icon to toggle; right-click it to change the shortcut or the badge position.
-//! Settings are kept in %APPDATA%\mutekey\settings.ini.
+//! while muted, and a tray icon (red mic-off = muted). Left-click the tray icon to
+//! toggle; right-click it for the shortcut, the badge's position and size, and startup.
+//! Settings are kept in %APPDATA%\mutekey\settings.ini. Badge and tray follow the
+//! Windows light/dark mode, styled after Fluent 2 (WinUI's InfoBar and flyouts).
 
 #![windows_subsystem = "windows"]
 
@@ -26,29 +27,69 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Badge geometry in 96-DPI pixels; it is rendered for the primary screen's DPI.
 const BADGE_HEIGHT: i32 = 40;
-const BADGE_PADDING: i32 = 16;
-const BADGE_GLYPH_SIZE: i32 = 18;
+const BADGE_RADIUS: i32 = 8; // Fluent's OverlayCornerRadius
+const BADGE_PADDING: i32 = 14;
 const BADGE_GAP: i32 = 10;
-const BADGE_FONT_SIZE: i32 = 15;
+const GLYPH_SIZE: i32 = 16;
+const TEXT_SIZE: i32 = 14; // Fluent "Body Strong": 14 px semibold
+const CHIP_TEXT_SIZE: i32 = 12; // Fluent "Caption"
+const CHIP_HEIGHT: i32 = 22;
+const CHIP_PADDING: i32 = 7;
+const CHIP_RADIUS: i32 = 4; // Fluent's ControlCornerRadius
 const BADGE_SCREEN_MARGIN: i32 = 24; // from the work area's edges, i.e. above the taskbar
-const SHADOW_BLUR: i32 = 12;
-const SHADOW_OFFSET: i32 = 2;
-const SHADOW_OPACITY: f32 = 0.3;
-const BADGE_TEXT: &str = "Microphone muted";
-const CAPTURE_TEXT: &str = "Press the new shortcut  \u{00B7}  Esc to cancel";
+const SHADOW_BLUR: i32 = 16;
+const SHADOW_OFFSET: i32 = 4;
+const BADGE_TEXT: &str = "Muted";
+const CAPTURE_TEXT: &str = "Press the new shortcut";
+const CAPTURE_CHIP: &str = "Esc to cancel";
 const PREVIEW_MS: u32 = 2500;
 const CAPTURE_TIMEOUT_MS: u32 = 15_000;
 
-// Icon resources (resources.rc, drawn by icons/make_icons.py).
-const ICON_LIVE: u16 = 101;
-const ICON_MUTED: u16 = 102;
-const ICON_NONE: u16 = 103;
-const GLYPH_MUTED: u16 = 104;
-const GLYPH_KEYBOARD: u16 = 105;
+// Segoe Fluent Icons glyphs (Segoe MDL2 Assets has the same ones on Windows 10).
+const MIC_OFF_GLYPH: u16 = 0xEC54;
+const KEYBOARD_GLYPH: u16 = 0xE765;
 
-const RED: COLORREF = rgb(196, 43, 28);
-const DARK: COLORREF = rgb(44, 44, 44);
-const WHITE: COLORREF = rgb(255, 255, 255);
+// Tray icon resources (resources.rc, drawn by icons/make_icons.py): live, muted, none.
+const TRAY_ICONS_LIGHT: [u16; 3] = [101, 102, 103];
+const TRAY_ICONS_DARK: [u16; 3] = [111, 112, 113];
+
+/// Fluent 2 colors for one theme, from WinUI's theme resources. Translucent tokens are
+/// (color, opacity) and get flattened onto whatever is under them.
+struct Palette {
+    critical_background: u32, // SystemFillColorCriticalBackground (InfoBar, error severity)
+    neutral_background: u32,  // AcrylicBackgroundFillColorDefault, as a solid color
+    critical: u32,            // SystemFillColorCritical
+    text: (u32, f32),         // TextFillColorPrimary
+    text_secondary: (u32, f32),
+    stroke: (u32, f32),       // SurfaceStrokeColorFlyout
+    chip_fill: (u32, f32),    // ControlFillColorDefault
+    chip_stroke: (u32, f32),  // ControlStrokeColorDefault
+    shadow: f32,              // flyout shadow opacity
+}
+
+const LIGHT: Palette = Palette {
+    critical_background: 0xFDE7E9,
+    neutral_background: 0xF9F9F9,
+    critical: 0xC42B1C,
+    text: (0x000000, 0.894),
+    text_secondary: (0x000000, 0.62),
+    stroke: (0x000000, 0.058),
+    chip_fill: (0xFFFFFF, 0.7),
+    chip_stroke: (0x000000, 0.058),
+    shadow: 0.14,
+};
+
+const DARK: Palette = Palette {
+    critical_background: 0x442726,
+    neutral_background: 0x2C2C2C,
+    critical: 0xFF99A4,
+    text: (0xFFFFFF, 1.0),
+    text_secondary: (0xFFFFFF, 0.786),
+    stroke: (0x000000, 0.2),
+    chip_fill: (0xFFFFFF, 0.061),
+    chip_stroke: (0xFFFFFF, 0.07),
+    shadow: 0.3,
+};
 
 const POLL_TIMER_ID: usize = 1;
 const PREVIEW_TIMER_ID: usize = 2;
@@ -62,14 +103,11 @@ const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
 const MENU_SHORTCUT: usize = 3;
 const MENU_AUTOSTART: usize = 4;
+const MENU_COMPACT: usize = 5;
 const MENU_POSITION: usize = 10; // + index into POSITIONS
 
 // Marks keystrokes mutekey injects itself, so its own hook lets them through.
 const INJECTED: usize = 0x6D75_7465;
-
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum MicState {
@@ -111,6 +149,7 @@ const POSITIONS: [(Position, &str, &str); 6] = [
 struct Settings {
     hotkey: Hotkey,
     position: Position,
+    compact: bool, // the badge shows just the icon
 }
 
 #[derive(Clone, Copy)]
@@ -118,9 +157,13 @@ struct App {
     instance: HINSTANCE,
     controller: HWND, // hidden window that owns the timers and tray icon
     badge: HWND,
-    icon_live: HICON,
-    icon_muted: HICON,
-    icon_none: HICON,
+    light: bool,            // Windows is in light mode
+    tray_icons: [HICON; 3], // live, muted, none, for that mode's taskbar
+    text_face: &'static str,
+    // GDI sees each weight of the variable font as its own family; asking "Segoe UI
+    // Variable Text" for semibold would get a synthesized bold instead.
+    strong_face: &'static str,
+    icon_face: &'static str,
     taskbar_created: u32,
 }
 
@@ -182,14 +225,16 @@ fn run() -> Result<()> {
             0, 0, 0, 0, controller, None, instance, None,
         )?;
 
-        let tray_size = GetSystemMetrics(SM_CXSMICON);
+        let light = light_mode();
         APP.set(Some(App {
             instance,
             controller,
             badge,
-            icon_live: load_icon(instance, ICON_LIVE, tray_size)?,
-            icon_muted: load_icon(instance, ICON_MUTED, tray_size)?,
-            icon_none: load_icon(instance, ICON_NONE, tray_size)?,
+            light,
+            tray_icons: tray_icons(instance, light)?,
+            text_face: installed_face("Segoe UI Variable Text", "Segoe UI"),
+            strong_face: installed_face("Segoe UI Variable Text Semibold", "Segoe UI"),
+            icon_face: installed_face("Segoe Fluent Icons", "Segoe MDL2 Assets"),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));
 
@@ -238,8 +283,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 WM_RBUTTONUP => show_menu(app),
                 _ => {}
             },
-            // Resolution, scaling or taskbar changes move the work area the badge is placed in.
-            WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd == app.controller => update_badge(),
+            // Resolution, scaling or taskbar changes move the work area the badge is placed in;
+            // a light/dark switch arrives as WM_SETTINGCHANGE too.
+            WM_DISPLAYCHANGE | WM_SETTINGCHANGE if hwnd == app.controller => {
+                if light_mode() != app.light {
+                    if let Ok(icons) = tray_icons(app.instance, !app.light) {
+                        for icon in app.tray_icons {
+                            let _ = DestroyIcon(icon);
+                        }
+                        APP.set(Some(App { light: !app.light, tray_icons: icons, ..app }));
+                        let _ = Shell_NotifyIconW(NIM_MODIFY, &tray_data(APP.get().unwrap(), STATE.get()));
+                    }
+                }
+                update_badge();
+            }
             WM_DESTROY if hwnd == app.controller => {
                 let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(app, MicState::NoMicrophone));
                 PostQuitMessage(0);
@@ -442,7 +499,7 @@ impl Position {
 }
 
 impl Settings {
-    const DEFAULT: Settings = Settings { hotkey: Hotkey::DEFAULT, position: Position::BottomCenter };
+    const DEFAULT: Settings = Settings { hotkey: Hotkey::DEFAULT, position: Position::BottomCenter, compact: false };
 
     fn path() -> Option<PathBuf> {
         Some(PathBuf::from(std::env::var_os("APPDATA")?).join("mutekey").join("settings.ini"))
@@ -461,6 +518,7 @@ impl Settings {
                         settings.position = p.0;
                     }
                 }
+                "badge" => settings.compact = value.trim().eq_ignore_ascii_case("compact"),
                 _ => {}
             }
         }
@@ -472,9 +530,11 @@ impl Settings {
         let text = format!(
             "; mutekey settings. Also changeable from the tray menu; restart mutekey after editing.\r\n\
              ; position: top-left, top-center, top-right, bottom-left, bottom-center or bottom-right\r\n\
-             hotkey={}\r\nposition={}\r\n",
+             ; badge: full (icon, text and shortcut) or compact (icon only)\r\n\
+             hotkey={}\r\nposition={}\r\nbadge={}\r\n",
             self.hotkey.label(),
             self.position.name(),
+            if self.compact { "compact" } else { "full" },
         );
         let written = path.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&path, text));
         if let Err(e) = written {
@@ -539,11 +599,28 @@ fn apply_state(tray_action: NOTIFY_ICON_MESSAGE) {
 
 fn update_badge() {
     let Some(app) = APP.get() else { return };
+    let palette = if app.light { &LIGHT } else { &DARK };
+    let settings = SETTINGS.get();
     unsafe {
         if CAPTURING.get() {
-            show_badge(app, DARK, GLYPH_KEYBOARD, CAPTURE_TEXT);
+            let background = rgb(palette.neutral_background);
+            let look = Look {
+                background,
+                glyph: KEYBOARD_GLYPH,
+                glyph_color: over(background, palette.text),
+                text: Some(CAPTURE_TEXT.to_string()),
+                chip: Some(CAPTURE_CHIP.to_string()),
+            };
+            show_badge(app, palette, &look);
         } else if STATE.get() == MicState::Muted || PREVIEW.get() {
-            show_badge(app, RED, GLYPH_MUTED, BADGE_TEXT);
+            let look = Look {
+                background: rgb(palette.critical_background),
+                glyph: MIC_OFF_GLYPH,
+                glyph_color: rgb(palette.critical),
+                text: (!settings.compact).then(|| BADGE_TEXT.to_string()),
+                chip: (!settings.compact).then(|| settings.hotkey.label()),
+            };
+            show_badge(app, palette, &look);
         } else {
             let _ = ShowWindow(app.badge, SW_HIDE);
         }
@@ -552,10 +629,11 @@ fn update_badge() {
 
 fn tray_data(app: App, state: MicState) -> NOTIFYICONDATAW {
     let shortcut = SETTINGS.get().hotkey.label();
+    let [live, muted, none] = app.tray_icons;
     let (icon, tip) = match state {
-        MicState::Live => (app.icon_live, format!("Microphone live ({shortcut} to mute)")),
-        MicState::Muted => (app.icon_muted, format!("Microphone muted ({shortcut} to unmute)")),
-        MicState::NoMicrophone => (app.icon_none, "No microphone found".to_string()),
+        MicState::Live => (live, format!("Microphone live ({shortcut} to mute)")),
+        MicState::Muted => (muted, format!("Microphone muted ({shortcut} to unmute)")),
+        MicState::NoMicrophone => (none, "No microphone found".to_string()),
     };
     let mut data = NOTIFYICONDATAW {
         cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -590,6 +668,8 @@ unsafe fn show_menu(app: App) {
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_SHORTCUT, w!("Change shortcut\u{2026}"));
     let _ = AppendMenuW(menu, MF_POPUP, positions.0 as usize, w!("Badge position"));
+    let compact_flags = if settings.compact { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, compact_flags, MENU_COMPACT, w!("Compact badge"));
     let autostart_flags = if starts_with_windows() { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(menu, autostart_flags, MENU_AUTOSTART, w!("Start with Windows"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -616,12 +696,9 @@ unsafe fn show_menu(app: App) {
             update_badge();
         }
         id if (MENU_POSITION..=last).contains(&id) => {
-            SETTINGS.set(Settings { position: POSITIONS[id - MENU_POSITION].0, ..settings });
-            SETTINGS.get().save();
-            PREVIEW.set(true);
-            SetTimer(app.controller, PREVIEW_TIMER_ID, PREVIEW_MS, None);
-            update_badge();
+            change_badge(app, Settings { position: POSITIONS[id - MENU_POSITION].0, ..settings })
         }
+        MENU_COMPACT => change_badge(app, Settings { compact: !settings.compact, ..settings }),
         MENU_AUTOSTART => set_start_with_windows(!starts_with_windows()),
         MENU_EXIT => {
             set_mute(false);
@@ -629,6 +706,17 @@ unsafe fn show_menu(app: App) {
         }
         _ => {}
     }
+}
+
+/// Saves a new badge position or size and shows the badge there for a moment.
+fn change_badge(app: App, settings: Settings) {
+    SETTINGS.set(settings);
+    settings.save();
+    PREVIEW.set(true);
+    unsafe {
+        SetTimer(app.controller, PREVIEW_TIMER_ID, PREVIEW_MS, None);
+    }
+    update_badge();
 }
 
 fn finish_capture(app: App, hotkey: Option<Hotkey>) {
@@ -693,8 +781,18 @@ fn set_start_with_windows(enable: bool) {
     }
 }
 
-/// Renders the pill (glyph, text, soft shadow) into a per-pixel-alpha bitmap and shows it.
-unsafe fn show_badge(app: App, color: COLORREF, glyph: u16, text: &str) {
+/// What the badge shows; colors are already flattened onto `background`.
+struct Look {
+    background: [f32; 3],
+    glyph: u16,
+    glyph_color: [f32; 3],
+    text: Option<String>, // None: compact, just the glyph
+    chip: Option<String>, // a keyboard-key chip after the text, e.g. the shortcut
+}
+
+/// Renders the badge (Fluent InfoBar-like surface, glyph, text, chip, stroke and shadow)
+/// into a per-pixel-alpha bitmap and shows it.
+unsafe fn show_badge(app: App, palette: &Palette, look: &Look) {
     let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
     let mut info = MONITORINFO { cbSize: mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     let _ = GetMonitorInfoW(monitor, &mut info);
@@ -702,65 +800,120 @@ unsafe fn show_badge(app: App, color: COLORREF, glyph: u16, text: &str) {
     let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
     let px = |v: i32| v * dpi as i32 / 96;
 
-    let glyph_size = px(BADGE_GLYPH_SIZE);
-    let Ok(glyph) = load_icon(app.instance, glyph, glyph_size) else { return };
     let dc = CreateCompatibleDC(None);
-    let text_font = font("Segoe UI", px(BADGE_FONT_SIZE), FW_SEMIBOLD.0 as i32);
-    let mut text: Vec<u16> = text.encode_utf16().collect();
-    let mut text_size = SIZE::default();
+    let glyph_font = font(app.icon_face, px(GLYPH_SIZE), FW_NORMAL.0 as i32);
+    let text_font = font(app.strong_face, px(TEXT_SIZE), FW_SEMIBOLD.0 as i32);
+    let chip_font = font(app.text_face, px(CHIP_TEXT_SIZE), FW_NORMAL.0 as i32);
     let previous_font = SelectObject(dc, text_font);
-    let _ = GetTextExtentPoint32W(dc, &text, &mut text_size);
+    let measure = |font: HFONT, text: &str| {
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        SelectObject(dc, font);
+        let _ = GetTextExtentPoint32W(dc, &text, &mut size);
+        (text, size.cx)
+    };
+    let text = look.text.as_deref().map(|t| measure(text_font, t));
+    let chip = look.chip.as_deref().map(|t| measure(chip_font, t));
 
-    let pill_width = 2 * px(BADGE_PADDING) + glyph_size + px(BADGE_GAP) + text_size.cx;
-    let pill_height = px(BADGE_HEIGHT);
+    // Left to right: padding, glyph, [gap, text], [gap, chip], padding. A chip sits as far
+    // from the right edge as from the top and bottom.
+    let height = px(BADGE_HEIGHT);
+    let glyph_box = px(GLYPH_SIZE + 4);
+    let chip_width = chip.as_ref().map(|c| c.1 + 2 * px(CHIP_PADDING));
+    let chip_inset = (height - px(CHIP_HEIGHT)) / 2;
+    let mut width = match &text {
+        None => height,
+        Some((_, text_width)) => px(BADGE_PADDING) + glyph_box + px(BADGE_GAP) + text_width + px(BADGE_PADDING),
+    };
+    if let (Some(_), Some(chip_width)) = (&text, chip_width) {
+        width += px(BADGE_GAP) + chip_width - px(BADGE_PADDING) + chip_inset;
+    }
     let margin = px(SHADOW_BLUR) + px(SHADOW_OFFSET); // room for the shadow
-    let (width, height) = (pill_width + 2 * margin, pill_height + 2 * margin);
-    let Ok((bitmap, pixels)) = dib(width, height) else {
+    let (bitmap_width, bitmap_height) = (width + 2 * margin, height + 2 * margin);
+    let Ok((bitmap, pixels)) = dib(bitmap_width, bitmap_height) else {
         SelectObject(dc, previous_font);
-        let _ = DeleteObject(text_font);
+        for font in [glyph_font, text_font, chip_font] {
+            let _ = DeleteObject(font);
+        }
         let _ = DeleteDC(dc);
-        let _ = DestroyIcon(glyph);
         return;
     };
     let previous_bitmap = SelectObject(dc, bitmap);
+    let at = |x: i32, y: i32| (y * bitmap_width + x) as usize;
 
-    // Opaque pill color everywhere, then the text in white; alpha is worked out below.
-    let (r, g, b) = channels(color);
-    pixels.fill(r << 16 | g << 8 | b);
+    // 1. The surface color everywhere (alpha comes last), with the chip painted on.
+    pixels.fill(pack(look.background));
+    let chip_rect = chip_width.map(|chip_width| {
+        let right = margin + width - chip_inset;
+        RECT { left: right - chip_width, top: margin + chip_inset, right, bottom: margin + height - chip_inset }
+    });
+    let chip_fill = over(look.background, palette.chip_fill);
+    if let Some(r) = chip_rect.filter(|_| text.is_some()) {
+        let (half_w, half_h) = ((r.right - r.left) as f32 / 2.0, (r.bottom - r.top) as f32 / 2.0);
+        let (cx, cy) = (r.left as f32 + half_w, r.top as f32 + half_h);
+        let radius = px(CHIP_RADIUS) as f32;
+        for y in r.top - 1..r.bottom + 1 {
+            for x in r.left - 1..r.right + 1 {
+                let d = rounded_rect_distance(x as f32 + 0.5 - cx, y as f32 + 0.5 - cy, half_w, half_h, radius);
+                let fill = (0.5 - d).clamp(0.0, 1.0);
+                let color = mix(look.background, chip_fill, fill);
+                let color = mix(color, rgb(palette.chip_stroke.0), palette.chip_stroke.1 * edge(d, px(1) as f32));
+                pixels[at(x, y)] = pack(color);
+            }
+        }
+    }
+
+    // 2. Glyph, text and chip text, ClearType against the colors they sit on.
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, WHITE);
-    let left = margin + px(BADGE_PADDING);
-    let _ = DrawIconEx(dc, left, margin + (pill_height - glyph_size) / 2, glyph, glyph_size, glyph_size, 0, None, DI_NORMAL);
-    let mut rect = RECT { left: left + glyph_size + px(BADGE_GAP), top: margin, right: width, bottom: margin + pill_height };
-    DrawTextW(dc, &mut text, &mut rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+    let glyph_left = if text.is_some() { margin + px(BADGE_PADDING) } else { margin + (height - glyph_box) / 2 };
+    let mut rect = RECT { left: glyph_left, top: margin, right: glyph_left + glyph_box, bottom: margin + height };
+    SelectObject(dc, glyph_font);
+    SetTextColor(dc, colorref(look.glyph_color));
+    DrawTextW(dc, &mut [look.glyph], &mut rect, flags | DT_CENTER);
+    if let Some((mut text, _)) = text {
+        let mut rect = RECT { left: rect.right + px(BADGE_GAP), top: margin, right: margin + width, bottom: margin + height };
+        SelectObject(dc, text_font);
+        SetTextColor(dc, colorref(over(look.background, palette.text)));
+        DrawTextW(dc, &mut text, &mut rect, flags | DT_LEFT);
+        if let (Some((mut chip, _)), Some(mut rect)) = (chip, chip_rect) {
+            SelectObject(dc, chip_font);
+            SetTextColor(dc, colorref(over(chip_fill, palette.text_secondary)));
+            DrawTextW(dc, &mut chip, &mut rect, flags | DT_CENTER);
+        }
+    }
     let _ = GdiFlush();
 
-    // Anti-aliased pill over a blurred shadow, premultiplied as UpdateLayeredWindow wants.
-    let (half_w, half_h) = (pill_width as f32 / 2.0, pill_height as f32 / 2.0);
-    let (center_x, center_y) = (width as f32 / 2.0, height as f32 / 2.0);
+    // 3. Anti-aliased shape with a hairline stroke, over a soft shadow, premultiplied as
+    // UpdateLayeredWindow wants.
+    let (half_w, half_h) = (width as f32 / 2.0, height as f32 / 2.0);
+    let (center_x, center_y) = (bitmap_width as f32 / 2.0, bitmap_height as f32 / 2.0);
     let (blur, offset) = (px(SHADOW_BLUR) as f32, px(SHADOW_OFFSET) as f32);
-    for y in 0..height {
-        for x in 0..width {
+    let radius = px(BADGE_RADIUS) as f32;
+    let stroke = rgb(palette.stroke.0);
+    for y in 0..bitmap_height {
+        for x in 0..bitmap_width {
             let (fx, fy) = (x as f32 + 0.5 - center_x, y as f32 + 0.5 - center_y);
-            let pill = (0.5 - pill_distance(fx, fy, half_w, half_h)).clamp(0.0, 1.0);
-            let shadow_distance = pill_distance(fx, fy - offset, half_w, half_h).max(0.0) / blur;
-            let shadow = SHADOW_OPACITY * (1.0 - shadow_distance.min(1.0)).powi(2);
-            let alpha = pill + shadow * (1.0 - pill);
-            let pixel = &mut pixels[(y * width + x) as usize];
-            let scale = |c: u32| ((c & 0xFF) as f32 * pill + 0.5) as u32;
-            *pixel = ((alpha * 255.0 + 0.5) as u32) << 24 | scale(*pixel >> 16) << 16 | scale(*pixel >> 8) << 8 | scale(*pixel);
+            let d = rounded_rect_distance(fx, fy, half_w, half_h, radius);
+            let shape = (0.5 - d).clamp(0.0, 1.0);
+            let shadow_distance = rounded_rect_distance(fx, fy - offset, half_w, half_h, radius).max(0.0) / blur;
+            let shadow = palette.shadow * (1.0 - shadow_distance.min(1.0)).powi(2);
+            let alpha = shape + shadow * (1.0 - shape);
+            let pixel = &mut pixels[at(x, y)];
+            let color = mix(unpack(*pixel), stroke, palette.stroke.1 * edge(d, px(1) as f32));
+            *pixel = ((alpha * 255.0 + 0.5) as u32) << 24 | pack(color.map(|c| c * shape));
         }
     }
 
     let work = info.rcWork;
-    let edge = px(BADGE_SCREEN_MARGIN) - margin; // window edge to work-area edge
+    let gap = px(BADGE_SCREEN_MARGIN) - margin; // window edge to work-area edge
     let position = SETTINGS.get().position;
     let x = match position {
-        Position::TopLeft | Position::BottomLeft => work.left + edge,
-        Position::TopCenter | Position::BottomCenter => work.left + (work.right - work.left - width) / 2,
-        Position::TopRight | Position::BottomRight => work.right - edge - width,
+        Position::TopLeft | Position::BottomLeft => work.left + gap,
+        Position::TopCenter | Position::BottomCenter => work.left + (work.right - work.left - bitmap_width) / 2,
+        Position::TopRight | Position::BottomRight => work.right - gap - bitmap_width,
     };
-    let y = if position.is_top() { work.top + edge } else { work.bottom - edge - height };
+    let y = if position.is_top() { work.top + gap } else { work.bottom - gap - bitmap_height };
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
@@ -768,7 +921,7 @@ unsafe fn show_badge(app: App, color: COLORREF, glyph: u16, text: &str) {
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
     let _ = UpdateLayeredWindow(
-        app.badge, None, Some(&POINT { x, y }), Some(&SIZE { cx: width, cy: height }),
+        app.badge, None, Some(&POINT { x, y }), Some(&SIZE { cx: bitmap_width, cy: bitmap_height }),
         dc, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA,
     );
     let _ = SetWindowPos(app.badge, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -776,17 +929,43 @@ unsafe fn show_badge(app: App, color: COLORREF, glyph: u16, text: &str) {
     SelectObject(dc, previous_bitmap);
     SelectObject(dc, previous_font);
     let _ = DeleteObject(bitmap);
-    let _ = DeleteObject(text_font);
+    for font in [glyph_font, text_font, chip_font] {
+        let _ = DeleteObject(font);
+    }
     let _ = DeleteDC(dc);
-    let _ = DestroyIcon(glyph);
 }
 
-/// Signed distance from a point (relative to the center) to a pill with the given half-extents.
-fn pill_distance(x: f32, y: f32, half_w: f32, half_h: f32) -> f32 {
-    let radius = half_h.min(half_w);
+/// Signed distance from a point (relative to the center) to a rounded rectangle.
+fn rounded_rect_distance(x: f32, y: f32, half_w: f32, half_h: f32, radius: f32) -> f32 {
     let qx = x.abs() - (half_w - radius);
     let qy = y.abs() - (half_h - radius);
     qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius
+}
+
+/// Coverage of a `width`-pixel line just inside a shape's edge, from its signed distance.
+fn edge(distance: f32, width: f32) -> f32 {
+    (0.5 - ((distance + width / 2.0).abs() - width / 2.0)).clamp(0.0, 1.0)
+}
+
+/// SystemUsesLightTheme: the mode of the taskbar and system flyouts, which the badge and
+/// tray icon sit next to. Windows 11 defaults to light.
+fn light_mode() -> bool {
+    let mut value = 1u32;
+    let mut size = mem::size_of::<u32>() as u32;
+    unsafe {
+        let _ = RegGetValueW(
+            HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"), RRF_RT_REG_DWORD, None,
+            Some(&mut value as *mut u32 as *mut c_void), Some(&mut size),
+        );
+    }
+    value != 0
+}
+
+fn tray_icons(instance: HINSTANCE, light: bool) -> Result<[HICON; 3]> {
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    let [live, muted, none] = if light { TRAY_ICONS_LIGHT } else { TRAY_ICONS_DARK };
+    Ok([load_icon(instance, live, size)?, load_icon(instance, muted, size)?, load_icon(instance, none, size)?])
 }
 
 /// One of the icons in resources.rc, at the given size (each .ico holds several).
@@ -816,8 +995,48 @@ unsafe fn dib(width: i32, height: i32) -> Result<(HBITMAP, &'static mut [u32])> 
     Ok((bitmap, std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize)))
 }
 
-fn channels(color: COLORREF) -> (u32, u32, u32) {
-    (color.0 & 0xFF, (color.0 >> 8) & 0xFF, (color.0 >> 16) & 0xFF)
+// Colors as [r, g, b] in 0..=255, so they can be mixed.
+fn rgb(hex: u32) -> [f32; 3] {
+    unpack(hex)
+}
+
+fn unpack(pixel: u32) -> [f32; 3] {
+    [(pixel >> 16 & 0xFF) as f32, (pixel >> 8 & 0xFF) as f32, (pixel & 0xFF) as f32]
+}
+
+fn pack(color: [f32; 3]) -> u32 {
+    let [r, g, b] = color.map(|c| (c + 0.5).clamp(0.0, 255.0) as u32);
+    r << 16 | g << 8 | b
+}
+
+fn colorref(color: [f32; 3]) -> COLORREF {
+    let [r, g, b] = color.map(|c| (c + 0.5).clamp(0.0, 255.0) as u32);
+    COLORREF(r | g << 8 | b << 16)
+}
+
+fn mix(base: [f32; 3], top: [f32; 3], amount: f32) -> [f32; 3] {
+    [0, 1, 2].map(|i| base[i] + (top[i] - base[i]) * amount)
+}
+
+/// A translucent Fluent token over a solid color.
+fn over(base: [f32; 3], token: (u32, f32)) -> [f32; 3] {
+    mix(base, rgb(token.0), token.1)
+}
+
+/// `preferred` if it is installed (GDI substitutes silently otherwise), else `fallback`.
+fn installed_face(preferred: &'static str, fallback: &'static str) -> &'static str {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let probe = font(preferred, 16, FW_NORMAL.0 as i32);
+        let previous = SelectObject(dc, probe);
+        let mut name = [0u16; 32];
+        let len = GetTextFaceW(dc, Some(&mut name)).max(0) as usize;
+        SelectObject(dc, previous);
+        let _ = DeleteObject(probe);
+        let _ = DeleteDC(dc);
+        let found = String::from_utf16_lossy(&name[..len.min(32)]);
+        if found.trim_end_matches('\0').eq_ignore_ascii_case(preferred) { preferred } else { fallback }
+    }
 }
 
 fn font(face: &str, height: i32, weight: i32) -> HFONT {
@@ -825,6 +1044,7 @@ fn font(face: &str, height: i32, weight: i32) -> HFONT {
         lfHeight: -height,
         lfWeight: weight,
         // ClearType: Segoe UI's hinting turns grayscale smoothing off at badge sizes.
+        // The badge is opaque wherever text is drawn, so it has a solid color to blend with.
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };

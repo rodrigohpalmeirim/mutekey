@@ -2,11 +2,12 @@
 
 Every size is drawn directly from signed-distance shapes (not scaled down from a big
 image), so small sizes stay crisp. Writes into this directory:
-  mutekey.ico          app icon: a dark keycap with a red mic-off symbol
-  live/muted/none.ico  tray icons: white mic on a green/red/gray circle
-  badge-muted.ico      white mic-off glyph drawn on the badge
-  badge-keyboard.ico   white keyboard glyph for the "press the new shortcut" prompt
-  preview.png          all of the above, enlarged, for eyeballing
+  mutekey.ico                app icon: a dark keycap with a red mic-off symbol
+  tray-{live,muted,none}-{light,dark}.ico
+                             tray icons in the style of Windows' own: a black (light
+                             taskbar) or white (dark taskbar) mic, dimmed when there is
+                             none, and a mic-off in Fluent's critical red when muted
+  preview.png                all of the above, enlarged, for eyeballing
 """
 
 import struct
@@ -19,16 +20,14 @@ from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 
-RED = (196, 43, 28)
+RED = (196, 43, 28)  # Fluent SystemFillColorCritical, light theme
+PINK_RED = (255, 153, 164)  # the same token, dark theme
 BRIGHT_RED = (232, 72, 58)
-GREEN = (16, 160, 72)
-GRAY = (128, 128, 128)
 WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
 
 APP_SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
 TRAY_SIZES = [16, 20, 24, 28, 32, 40, 48, 64]
-# The badge glyph is 18 px at 100% scaling; these cover 100% to 250%.
-GLYPH_SIZES = [18, 20, 23, 27, 32, 36, 41, 45]
 
 
 class Canvas:
@@ -129,18 +128,6 @@ def microphone(c, scale, oy=0.0, muted=False, weight=0.09):
     return mic
 
 
-def keyboard(c):
-    stroke = max(0.16, 2 / c.px)
-    outline = np.abs(rounded_rect(c, 0, 0, 0.92, 0.56, 0.16)) - stroke / 2
-    keys = []
-    for row, y in enumerate((-0.24, 0.02)):
-        for i in range(5):
-            x = -0.56 + i * 0.28
-            keys.append(rounded_rect(c, x, y, 0.07, 0.07, 0.03))
-    keys.append(segment(c, -0.42, 0.3, 0.42, 0.3, stroke))
-    return union(outline, *keys)
-
-
 def app_icon(size):
     c = Canvas(size)
     if size <= 24:
@@ -156,16 +143,13 @@ def app_icon(size):
     return c.image()
 
 
-def tray_icon(size, color, muted):
+def tray_icon(size, state, taskbar):
     c = Canvas(size)
-    c.paint(circle(c, 0, 0, 1 - 0.5 / c.px), color)
-    c.paint(microphone(c, 0.62, 0.03, muted=muted, weight=0.11), WHITE)
-    return c.image()
-
-
-def glyph_icon(size, draw):
-    c = Canvas(size)
-    c.paint(draw(c), WHITE)
+    ink = BLACK if taskbar == "light" else WHITE
+    if state == "muted":
+        c.paint(microphone(c, 0.98, 0.04, muted=True, weight=0.1), RED if taskbar == "light" else PINK_RED)
+    else:
+        c.paint(microphone(c, 0.98, 0.04, weight=0.1), ink, opacity=0.4 if state == "none" else 0.9 if taskbar == "light" else 1)
     return c.image()
 
 
@@ -189,19 +173,18 @@ def write_ico(path, images):
 def main():
     sets = {
         "mutekey": [app_icon(s) for s in APP_SIZES],
-        "live": [tray_icon(s, GREEN, False) for s in TRAY_SIZES],
-        "muted": [tray_icon(s, RED, True) for s in TRAY_SIZES],
-        "none": [tray_icon(s, GRAY, False) for s in TRAY_SIZES],
-        "badge-muted": [glyph_icon(s, lambda c: microphone(c, 0.92, 0.0, muted=True, weight=0.12)) for s in GLYPH_SIZES],
-        "badge-keyboard": [glyph_icon(s, keyboard) for s in GLYPH_SIZES],
     }
+    for state in ("live", "muted", "none"):
+        for taskbar in ("light", "dark"):
+            sets[f"tray-{state}-{taskbar}"] = [tray_icon(s, state, taskbar) for s in TRAY_SIZES]
     for name, images in sets.items():
         write_ico(HERE / f"{name}.ico", images)
 
     # Preview: each set on light and dark backgrounds, small sizes enlarged 4x (nearest).
     rows = []
     for name, images in sets.items():
-        for bg in ((243, 243, 243), (32, 32, 32), (196, 43, 28)) if name.startswith("badge") else ((243, 243, 243), (32, 32, 32)):
+        light, dark = (243, 243, 243), (32, 32, 32)
+        for bg in (light,) if name.endswith("-light") else (dark,) if name.endswith("-dark") else (light, dark):
             cells = []
             for img in images:
                 zoom = 4 if img.width <= 64 else 1
