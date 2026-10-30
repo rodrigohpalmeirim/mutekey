@@ -3,11 +3,12 @@
 #   mic.ps1 mute|unmute   set every active capture endpoint (like a third-party app would)
 #   mic.ps1 mute-one N    mute only endpoint N (0-based)
 #   mic.ps1 hotkey        press Win+Shift+A (must run in the desktop session)
+#   mic.ps1 press -Keys 0x11,0x12,0x4D   press keys (virtual-key codes) in order, release in reverse
 #   mic.ps1 hotkey-free   is Win+Shift+A free to register? (False while mutekey runs)
 #   mic.ps1 badge         is the mutekey badge window visible, and where?
 #   mic.ps1 click|rclick -X x -Y y   left/right-click at screen coordinates (desktop session)
 #   mic.ps1 scroll -X x -Y y -Index n  scroll n notches down (negative = up) at x,y
-param([Parameter(Mandatory)][string]$Action, [int]$Index = 0, [int]$X = 0, [int]$Y = 0)
+param([Parameter(Mandatory)][string]$Action, [int]$Index = 0, [int]$X = 0, [int]$Y = 0, [int[]]$Keys = @())
 
 Add-Type -TypeDefinition @'
 using System;
@@ -70,6 +71,11 @@ public static class Mic {
     }
 
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void Press(int[] keys) {
+        foreach (var k in keys) keybd_event((byte)k, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(50);
+        for (int i = keys.Length - 1; i >= 0; i--) keybd_event((byte)keys[i], 0, 2, UIntPtr.Zero);
+    }
     public static void PressWinShiftA() {
         const uint UP = 2;
         keybd_event(0x5B, 0, 0, UIntPtr.Zero); keybd_event(0x10, 0, 0, UIntPtr.Zero); keybd_event(0x41, 0, 0, UIntPtr.Zero);
@@ -117,6 +123,7 @@ switch ($Action) {
     'unmute'      { [Mic]::SetAll($false); [Mic]::Status() }
     'mute-one'    { [Mic]::SetOne($Index, $true); [Mic]::Status() }
     'hotkey'      { [Mic]::PressWinShiftA(); 'pressed Win+Shift+A' }
+    'press'       { [Mic]::Press($Keys); "pressed $($Keys -join ',')" }
     'hotkey-free' { "hotkey free=" + [Mic]::HotkeyFree() }
     'badge'       { [Mic]::Badge() }
     'click'       { [Mic]::Click($X, $Y, $false); "clicked $X,$Y" }

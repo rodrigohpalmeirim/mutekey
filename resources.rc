@@ -1,0 +1,7 @@
+// Icons made by icons/make_icons.py. The first icon is the executable's own.
+1   ICON "icons/mutekey.ico"
+101 ICON "icons/live.ico"
+102 ICON "icons/muted.ico"
+103 ICON "icons/none.ico"
+104 ICON "icons/badge-muted.ico"
+105 ICON "icons/badge-keyboard.ico"
