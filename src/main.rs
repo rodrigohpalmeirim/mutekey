@@ -62,7 +62,7 @@ struct Palette {
     text: (u32, f32),         // TextFillColorPrimary
     text_secondary: (u32, f32),
     stroke: (u32, f32),       // SurfaceStrokeColorFlyout
-    chip_fill: (u32, f32),    // ControlFillColorDefault
+    chip_fill: (u32, f32),    // SubtleFillColorSecondary: a label, not a control
     chip_stroke: (u32, f32),  // ControlStrokeColorDefault
     shadow: f32,              // flyout shadow opacity
 }
@@ -74,7 +74,7 @@ const LIGHT: Palette = Palette {
     text: (0x000000, 0.894),
     text_secondary: (0x000000, 0.62),
     stroke: (0x000000, 0.058),
-    chip_fill: (0xFFFFFF, 0.7),
+    chip_fill: (0x000000, 0.037),
     chip_stroke: (0x000000, 0.058),
     shadow: 0.14,
 };
@@ -86,7 +86,7 @@ const DARK: Palette = Palette {
     text: (0xFFFFFF, 1.0),
     text_secondary: (0xFFFFFF, 0.786),
     stroke: (0x000000, 0.2),
-    chip_fill: (0xFFFFFF, 0.061),
+    chip_fill: (0xFFFFFF, 0.06),
     chip_stroke: (0xFFFFFF, 0.07),
     shadow: 0.3,
 };
@@ -150,6 +150,9 @@ struct Settings {
     hotkey: Hotkey,
     position: Position,
     compact: bool, // the badge shows just the icon
+    // Kept here (not only in the Run key) so it can default to on, also for settings files
+    // written before the option existed.
+    start_with_windows: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +205,7 @@ fn run() -> Result<()> {
         if Settings::path().is_some_and(|path| !path.exists()) {
             settings.save(); // so there is a file to find and edit
         }
+        apply_start_with_windows(settings.start_with_windows);
 
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("mutekey");
@@ -499,7 +503,7 @@ impl Position {
 }
 
 impl Settings {
-    const DEFAULT: Settings = Settings { hotkey: Hotkey::DEFAULT, position: Position::BottomCenter, compact: false };
+    const DEFAULT: Settings = Settings { hotkey: Hotkey::DEFAULT, position: Position::BottomCenter, compact: false, start_with_windows: true };
 
     fn path() -> Option<PathBuf> {
         Some(PathBuf::from(std::env::var_os("APPDATA")?).join("mutekey").join("settings.ini"))
@@ -519,6 +523,7 @@ impl Settings {
                     }
                 }
                 "badge" => settings.compact = value.trim().eq_ignore_ascii_case("compact"),
+                "start_with_windows" => settings.start_with_windows = !value.trim().eq_ignore_ascii_case("false"),
                 _ => {}
             }
         }
@@ -531,10 +536,11 @@ impl Settings {
             "; mutekey settings. Also changeable from the tray menu; restart mutekey after editing.\r\n\
              ; position: top-left, top-center, top-right, bottom-left, bottom-center or bottom-right\r\n\
              ; badge: full (icon, text and shortcut) or compact (icon only)\r\n\
-             hotkey={}\r\nposition={}\r\nbadge={}\r\n",
+             hotkey={}\r\nposition={}\r\nbadge={}\r\nstart_with_windows={}\r\n",
             self.hotkey.label(),
             self.position.name(),
             if self.compact { "compact" } else { "full" },
+            self.start_with_windows,
         );
         let written = path.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&path, text));
         if let Err(e) = written {
@@ -699,7 +705,12 @@ unsafe fn show_menu(app: App) {
             change_badge(app, Settings { position: POSITIONS[id - MENU_POSITION].0, ..settings })
         }
         MENU_COMPACT => change_badge(app, Settings { compact: !settings.compact, ..settings }),
-        MENU_AUTOSTART => set_start_with_windows(!starts_with_windows()),
+        MENU_AUTOSTART => {
+            let enable = !starts_with_windows();
+            set_start_with_windows(enable);
+            SETTINGS.set(Settings { start_with_windows: enable, ..settings });
+            SETTINGS.get().save();
+        }
         MENU_EXIT => {
             set_mute(false);
             let _ = DestroyWindow(app.controller);
@@ -741,43 +752,65 @@ fn run_command() -> Option<HSTRING> {
 
 /// On when the Run entry points at this copy of mutekey and Task Manager hasn't disabled it.
 fn starts_with_windows() -> bool {
+    run_entry_is_current() && !disabled_in_task_manager()
+}
+
+fn run_entry_is_current() -> bool {
     let Some(command) = run_command() else { return false };
-    unsafe {
-        let mut value = [0u16; 1024];
-        let mut size = mem::size_of_val(&value) as u32;
-        let found = RegGetValueW(
+    let mut value = [0u16; 1024];
+    let mut size = mem::size_of_val(&value) as u32;
+    let found = unsafe {
+        RegGetValueW(
             HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None,
             Some(value.as_mut_ptr() as *mut c_void), Some(&mut size),
-        ) == ERROR_SUCCESS;
-        let len = (size as usize / 2).saturating_sub(1); // bytes, including the terminating NUL
-        if !found || !String::from_utf16_lossy(&value[..len]).eq_ignore_ascii_case(&command.to_string()) {
-            return false;
-        }
-        // The first byte is 2 when enabled and 3 when turned off there.
-        let mut approval = [0u8; 12];
-        let mut size = approval.len() as u32;
-        let recorded = RegGetValueW(
+        )
+    } == ERROR_SUCCESS;
+    let len = (size as usize / 2).saturating_sub(1); // bytes, including the terminating NUL
+    found && String::from_utf16_lossy(&value[..len]).eq_ignore_ascii_case(&command.to_string())
+}
+
+/// Task Manager's Startup apps page keeps the Run entry and records the choice here: the
+/// first byte is 2 when enabled and 3 when turned off.
+fn disabled_in_task_manager() -> bool {
+    let mut approval = [0u8; 12];
+    let mut size = approval.len() as u32;
+    let recorded = unsafe {
+        RegGetValueW(
             HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, RUN_VALUE, RRF_RT_REG_BINARY, None,
             Some(approval.as_mut_ptr() as *mut c_void), Some(&mut size),
-        ) == ERROR_SUCCESS;
-        !recorded || approval[0] & 1 == 0
+        )
+    } == ERROR_SUCCESS;
+    recorded && approval[0] & 1 == 1
+}
+
+/// At startup: make the Run entry match the setting (and this exe's current path), but leave
+/// a Task Manager "disabled" alone; that was the user's choice too.
+fn apply_start_with_windows(enable: bool) {
+    if enable != run_entry_is_current() {
+        write_run_entry(enable);
     }
 }
 
+/// From the menu: also clears Task Manager's record, which re-enables an entry turned off there.
 fn set_start_with_windows(enable: bool) {
     unsafe {
-        // Clearing Task Manager's record re-enables an entry the user turned off there.
         let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, RUN_VALUE);
-        let result = match run_command() {
+    }
+    write_run_entry(enable);
+}
+
+fn write_run_entry(enable: bool) {
+    let result = unsafe {
+        match run_command() {
             Some(command) if enable => RegSetKeyValueW(
                 HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ.0,
                 Some(command.as_ptr() as *const c_void), ((command.len() + 1) * 2) as u32,
             ),
             _ => RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE),
-        };
-        if result != ERROR_SUCCESS && !(result == ERROR_FILE_NOT_FOUND && !enable) {
-            error_box(&format!("Couldn't change the startup setting ({}).", result.0));
         }
+    };
+    if result != ERROR_SUCCESS && !(result == ERROR_FILE_NOT_FOUND && !enable) {
+        error_box(&format!("Couldn't change the startup setting ({}).", result.0));
     }
 }
 
