@@ -17,6 +17,7 @@ use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eCapture, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -60,6 +61,7 @@ const WM_SHORTCUT_CAPTURED: u32 = WM_APP + 3;
 const MENU_TOGGLE: usize = 1;
 const MENU_EXIT: usize = 2;
 const MENU_SHORTCUT: usize = 3;
+const MENU_AUTOSTART: usize = 4;
 const MENU_POSITION: usize = 10; // + index into POSITIONS
 
 // Marks keystrokes mutekey injects itself, so its own hook lets them through.
@@ -507,9 +509,11 @@ fn current_state() -> MicState {
 }
 
 fn toggle_mute() {
-    let mics = microphones().unwrap_or_default();
-    let mute = state_of(&mics) == MicState::Live;
-    for mic in &mics {
+    set_mute(current_state() == MicState::Live);
+}
+
+fn set_mute(mute: bool) {
+    for mic in &microphones().unwrap_or_default() {
         unsafe {
             let _ = mic.SetMute(BOOL::from(mute), ptr::null());
         }
@@ -586,8 +590,12 @@ unsafe fn show_menu(app: App) {
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_SHORTCUT, w!("Change shortcut\u{2026}"));
     let _ = AppendMenuW(menu, MF_POPUP, positions.0 as usize, w!("Badge position"));
+    let autostart_flags = if starts_with_windows() { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(menu, autostart_flags, MENU_AUTOSTART, w!("Start with Windows"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
+    // Exiting unmutes, so mutekey never leaves a muted mic behind with no badge to show it.
+    let exit_label = if STATE.get() == MicState::Muted { w!("Unmute and exit") } else { w!("Exit") };
+    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, exit_label);
 
     // The foreground dance is what lets the menu close when you click elsewhere.
     let mut cursor = POINT::default();
@@ -614,7 +622,9 @@ unsafe fn show_menu(app: App) {
             SetTimer(app.controller, PREVIEW_TIMER_ID, PREVIEW_MS, None);
             update_badge();
         }
+        MENU_AUTOSTART => set_start_with_windows(!starts_with_windows()),
         MENU_EXIT => {
+            set_mute(false);
             let _ = DestroyWindow(app.controller);
         }
         _ => {}
@@ -630,6 +640,57 @@ fn finish_capture(app: App, hotkey: Option<Hotkey>) {
         SETTINGS.get().save();
     }
     apply_state(NIM_MODIFY); // the tooltip names the shortcut
+}
+
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+// Where Task Manager's Startup apps page records entries the user turned off.
+const STARTUP_APPROVED_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
+const RUN_VALUE: PCWSTR = w!("mutekey");
+
+fn run_command() -> Option<HSTRING> {
+    Some(HSTRING::from(format!("\"{}\"", std::env::current_exe().ok()?.display())))
+}
+
+/// On when the Run entry points at this copy of mutekey and Task Manager hasn't disabled it.
+fn starts_with_windows() -> bool {
+    let Some(command) = run_command() else { return false };
+    unsafe {
+        let mut value = [0u16; 1024];
+        let mut size = mem::size_of_val(&value) as u32;
+        let found = RegGetValueW(
+            HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None,
+            Some(value.as_mut_ptr() as *mut c_void), Some(&mut size),
+        ) == ERROR_SUCCESS;
+        let len = (size as usize / 2).saturating_sub(1); // bytes, including the terminating NUL
+        if !found || !String::from_utf16_lossy(&value[..len]).eq_ignore_ascii_case(&command.to_string()) {
+            return false;
+        }
+        // The first byte is 2 when enabled and 3 when turned off there.
+        let mut approval = [0u8; 12];
+        let mut size = approval.len() as u32;
+        let recorded = RegGetValueW(
+            HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, RUN_VALUE, RRF_RT_REG_BINARY, None,
+            Some(approval.as_mut_ptr() as *mut c_void), Some(&mut size),
+        ) == ERROR_SUCCESS;
+        !recorded || approval[0] & 1 == 0
+    }
+}
+
+fn set_start_with_windows(enable: bool) {
+    unsafe {
+        // Clearing Task Manager's record re-enables an entry the user turned off there.
+        let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, RUN_VALUE);
+        let result = match run_command() {
+            Some(command) if enable => RegSetKeyValueW(
+                HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ.0,
+                Some(command.as_ptr() as *const c_void), ((command.len() + 1) * 2) as u32,
+            ),
+            _ => RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE),
+        };
+        if result != ERROR_SUCCESS && !(result == ERROR_FILE_NOT_FOUND && !enable) {
+            error_box(&format!("Couldn't change the startup setting ({}).", result.0));
+        }
+    }
 }
 
 /// Renders the pill (glyph, text, soft shadow) into a per-pixel-alpha bitmap and shows it.
