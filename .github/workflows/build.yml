@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Cross-compiles like local development does: MinGW provides the linker and windres.
       - name: Install MinGW-w64
@@ -37,7 +37,7 @@ jobs:
         working-directory: target/x86_64-pc-windows-gnu/release
         run: sha256sum mutekey.exe | tee mutekey.exe.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mutekey
           path: |
@@ -53,11 +53,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # so the tag's annotation is available
       - run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: mutekey
           path: dist
